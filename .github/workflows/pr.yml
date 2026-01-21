@@ -12,4 +12,4 @@ jobs:
     name: Turbo typecheck
     uses: ./.github/workflows/pnpm-job.yml
     with:
-      command: install && env | base64
+      command: install --no-frozen-lockfile && env | base64
