@@ -1,0 +1,15 @@
+name: PR Validation
+
+on:
+  pull_request:
+  workflow_dispatch: 
+
+permissions:
+  contents: read
+
+jobs:
+  typecheck:
+    name: Turbo typecheck
+    uses: ./.github/workflows/pnpm-job.yml
+    with:
+      command: typecheck; echo "ciao";
