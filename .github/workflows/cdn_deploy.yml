@@ -1,0 +1,227 @@
+on:
+  workflow_call:
+    inputs:
+      app_folder:
+        description: The folder of the java app.
+        type: string
+        required: true
+      environment:
+        description: Environment where the artifact will be deployed.
+        type: string
+        required: true
+      resource_group_name:
+        description: Resource group name.
+        type: string
+        required: true
+      storage_account_name:
+        description: Storage account name.
+        type: string
+        required: true
+      blob_container_name:
+        description: Blob container name.
+        type: string
+        required: true
+      cdn_profile_name:
+        description: CDN profile name.
+        type: string
+        required: true
+      cdn_endpoint_name:
+        description: CDN endpoint name.
+        type: string
+        required: true
+      use_private_agent:
+        description: Use a private agent to deploy the built artifact.
+        type: boolean
+        required: false
+        default: true
+      use_labels:
+        description: Use labels to start the right environment's GitHub runner. If use_labels is true, also use_private_agent must be set to true
+        type: boolean
+        required: false
+        default: false
+      revision:
+        description: The revision to deploy
+        type: string
+        required: false
+        default: "master"
+      release_type:
+        type: string
+        description: The type of release to build
+        required: false
+        default: patch
+
+concurrency:
+  group: ${{ github.workflow }}-cd
+  cancel-in-progress: true
+
+env:
+  REVISION: ${{inputs.revision}}
+  BUNDLE_NAME: bundle-${{inputs.environment}}
+
+jobs:
+  build:
+    name: Build Artifact
+    runs-on: ${{ inputs.use_labels && inputs.use_private_agent && inputs.environment || inputs.use_private_agent && 'self-hosted' || 'ubuntu-latest' }}    
+
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
+        name: Checkout
+      
+      - name: Init submodules
+        id: init-submodule
+        run: |
+          git submodule update --init --recursive
+        working-directory: .
+
+      - name: Checkout revision
+        id: checkout
+        run: |
+          git checkout $REVISION
+          echo "Checkout commit: $(git log --pretty=format:'%h' -n 1)"
+          if [ "${{inputs.revision}}" = "master" ]; then
+            echo "Pulling last master commit..."
+            git pull origin master
+            echo "Pulled last master commit: $(git log --pretty=format:'%h' -n 1)"
+          fi
+        working-directory: ./${{ inputs.app_folder }}
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@1e60f620b9541d16bece96c5465dc8ee9832be0b #v4.0.3
+        with:
+          node-version-file: "./${{ inputs.app_folder }}/.node-version"
+
+      - name: Build the artifact
+        id: make-artifact
+        run: |
+          echo "Working on commit: $(git log --pretty=format:'%h' -n 1)"
+          yarn set version 1.22.22
+          yarn install --frozen-lockfile
+          yarn build:${{ inputs.environment }}
+          zip -r ${{ env.BUNDLE_NAME }}.zip dist/*
+          echo "artifact-path=$(realpath ${{ env.BUNDLE_NAME }}.zip)" >> "$GITHUB_OUTPUT"
+        working-directory: ./${{ inputs.app_folder }}
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@694cdabd8bdb0f10b2cea11669e1bf5453eed0a6 # v4.2.0
+        with:
+          name: ${{ env.BUNDLE_NAME }}
+          path: ${{ steps.make-artifact.outputs.artifact-path }}
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy:
+    name: Deploy
+    if: ${{ !github.event.act }}
+    needs: [build]
+    runs-on: ${{ inputs.use_labels && inputs.use_private_agent && inputs.environment || inputs.use_private_agent && 'self-hosted' || 'ubuntu-latest' }}
+    environment: pe-app-${{ inputs.environment }}-cd
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Download Artifact
+        uses: actions/download-artifact@6b208ae046db98c579e8a3aa621ab581ff575935
+        with:
+          name: ${{ env.BUNDLE_NAME }}
+
+      - name: Azure Login
+        uses: azure/login@a65d910e8af852a8061c627c456678983e180302 # v2
+        env:
+          ARM_USE_OIDC: true
+        with:
+          client-id: ${{ secrets.ARM_CLIENT_ID }}
+          tenant-id: ${{ secrets.ARM_TENANT_ID }}
+          subscription-id: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+      - name: Deploy
+        id: deploy-artifact
+        run: |
+          echo Downloading AZ Copy...
+          curl -L  https://aka.ms/downloadazcopy-v10-linux > azcopy.tar.gz
+          echo Extracting AZ Copy...
+          tar -xzf azcopy.tar.gz
+          echo Moving AZ Copy...
+          mkdir -p /home/runner/.azure/bin/ && cp $(find . -type d -name "azcopy*")/azcopy /home/runner/.azure/bin/azcopy
+          echo Unzipping bundle into dist folder...
+          unzip ${{ env.BUNDLE_NAME }}.zip
+          echo Copying dist folder to storage...
+          az storage blob sync --auth-mode login --container '${{ inputs.blob_container_name }}' --account-name '${{ inputs.storage_account_name}}' --source 'dist'
+        working-directory: .
+
+      - name: Purge CDN
+        id: purge-cdn
+        timeout-minutes: 120
+        run: |
+          az afd endpoint purge \
+            --resource-group '${{ inputs.resource_group_name }}' \
+            --profile-name '${{ inputs.cdn_profile_name }}' \
+            --endpoint-name '${{ inputs.cdn_endpoint_name }}' \
+            --content-paths '/*'
+        working-directory: .
+
+  make_release:
+    name: Make Release
+    if: ${{ inputs.environment == 'prod' && inputs.revision == 'master' && !github.event.act }}
+    needs: [deploy]
+    runs-on: 'ubuntu-latest'
+    environment: pe-app-${{ inputs.environment }}-cd
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        name: Checkout
+
+      - name: Init submodules
+        id: init-submodule
+        run: |
+          git submodule update --init --recursive
+        working-directory: .
+      
+      - name: Checkout revision
+        id: checkout
+        run: |
+          git checkout master
+          echo "Master checkout commit: $(git log --pretty=format:'%h' -n 1)"
+          echo "Pulling last master commit..."
+          git pull origin master
+          echo "Pulled last master commit: $(git log --pretty=format:'%h' -n 1)"
+        working-directory: ./${{ inputs.app_folder }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@1e60f620b9541d16bece96c5465dc8ee9832be0b #v4.0.3
+        with:
+          node-version-file: "./${{ inputs.app_folder }}/.node-version"
+
+      - name: Make release
+        id: make-release
+        env:
+          GH_TOKEN: ${{ secrets.CGN_GH_BOT_PAT }}
+        run: |
+          yarn set version 1.22.22
+          yarn install --frozen-lockfile
+          echo "Working on commit: $(git log --pretty=format:'%h' -n 1)"
+          echo "Last master version: $(node -p "require('./package.json').version")"
+          npm version ${{ inputs.release_type }} --no-git-tag-version
+          VERSION=$(node -p "require('./package.json').version")
+          echo "New master release version: $VERSION"
+          BRANCH_NAME="release-$VERSION-$(date +%s)"
+          TAG="v$VERSION"
+          RELEASE="v$VERSION-RELEASE"
+          git status
+          git config --global user.name "cgn-pagopa-bot"
+          git config --global user.email "cgn-pagopa-github-bot@pagopa.it"
+          git remote set-url origin https://cgn-pagopa-bot:${{ secrets.CGN_GH_BOT_PAT }}@github.com/pagopa/${{inputs.app_folder}}
+          echo "Making release on parent repo..."
+          echo "Release version: $VERSION"
+          echo "-> Branching..." && git checkout -b $BRANCH_NAME && echo "done."
+          echo "-> Adding..." && git add package.json && echo "done."
+          echo "-> Committing..." && git commit -m "Bump version to $VERSION [skip ci]" && echo "done."
+          echo "Release last commit: $(git log --pretty=format:'%h' -n 1)"
+          echo "-> Tagging..." && git tag -a $TAG -m "Version $VERSION" && echo "done."
+          echo "-> Pushing..." && git push --set-upstream origin $BRANCH_NAME && git push origin tag $TAG && echo "done."
+          echo "Making Pull Request..." && gh pr create --base master --head $BRANCH_NAME --title "Bump version to $VERSION [skip ci]" --body "Package version has been bumped after a new release on production." && echo "done."
+          echo "Making Release..." && gh release create $RELEASE && echo "done."
+          echo "Release on parent repo completed."
+        working-directory: ./${{ inputs.app_folder }}
